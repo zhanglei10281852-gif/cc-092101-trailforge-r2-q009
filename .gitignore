@@ -1,0 +1,64 @@
+﻿# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+build/
+out/
+target/
+*.o
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Lock files (optional, uncomment if needed)
+# package-lock.json
+# yarn.lock
+
+# Coverage & test
+coverage/
+.nyc_output/
+htmlcov/
+
+# Docker
+.docker/
+
+# Python tooling
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Local SQLite runtime data
+*.db
+*.sqlite
+*.sqlite3
+data/

@@ -93,6 +93,7 @@ class ExpeditionService(ServiceBase):
     def update(
         self, expedition_id: int, data: ExpeditionUpdate, *, actor_id: int
     ) -> ExpeditionResponse:
+        self.ensure_immediate_transaction()
         expedition = self.expeditions.get_detail(expedition_id, for_update=True)
         if expedition is None:
             raise NotFoundError(f"Expedition {expedition_id} was not found")
@@ -130,6 +131,7 @@ class ExpeditionService(ServiceBase):
         return ExpeditionResponse.model_validate(expedition)
 
     def change_status(self, expedition_id: int, data: ActivityStateChange) -> ExpeditionResponse:
+        self.ensure_immediate_transaction()
         expedition = self.expeditions.get_detail(expedition_id, for_update=True)
         if expedition is None:
             raise NotFoundError(f"Expedition {expedition_id} was not found")
@@ -167,6 +169,7 @@ class ExpeditionService(ServiceBase):
         return ExpeditionResponse.model_validate(expedition)
 
     def register(self, expedition_id: int, data: RegistrationCreate) -> RegistrationResponse:
+        self.ensure_immediate_transaction()
         scope = f"expedition:{expedition_id}:register"
         prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
         if prior is not None:
@@ -253,6 +256,7 @@ class ExpeditionService(ServiceBase):
         return response
 
     def withdraw(self, expedition_id: int, data: WithdrawalRequest) -> RegistrationResponse:
+        self.ensure_immediate_transaction()
         scope = f"expedition:{expedition_id}:withdraw"
         prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
         if prior is not None:

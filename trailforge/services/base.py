@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
+from trailforge.database.session import begin_immediate
 from trailforge.domain.enums import AuditAction
 from trailforge.errors import IdempotencyConflictError
 from trailforge.models.audit import AuditLog, IdempotencyRecord
@@ -27,6 +28,15 @@ SENSITIVE_FIELDS = {
 class ServiceBase:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def ensure_immediate_transaction(self) -> None:
+        """Serialize this transaction against other SQLite writers.
+
+        Check-then-write flows (capacity, itinerary conflicts, idempotency)
+        are only correct if no other connection can commit between the
+        checks and the writes. See :func:`begin_immediate`.
+        """
+        begin_immediate(self.session)
 
     def audit(
         self,

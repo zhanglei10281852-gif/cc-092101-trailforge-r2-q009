@@ -6,14 +6,14 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from trailforge import __version__
 from trailforge.api import api_router
 from trailforge.config import Settings, get_settings
 from trailforge.database.migrations import initialize_database
-from trailforge.database.session import Database
-from trailforge.errors import TrailForgeError
+from trailforge.database.session import Database, is_sqlite_busy
+from trailforge.errors import DatabaseBusyError, TrailForgeError
 from trailforge.schemas.common import HealthResponse
 
 
@@ -95,6 +95,27 @@ def register_error_handlers(app: FastAPI) -> None:
                 "detail": {
                     "code": "database_constraint_conflict",
                     "message": "operation conflicts with a database constraint",
+                    "context": {},
+                }
+            },
+        )
+
+    @app.exception_handler(OperationalError)
+    async def handle_operational_error(
+        request: Request, exc: OperationalError
+    ) -> JSONResponse:
+        del request
+        if is_sqlite_busy(exc):
+            error = DatabaseBusyError("database is busy; retry the request")
+            return JSONResponse(
+                status_code=error.status_code, content={"detail": error.as_detail()}
+            )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "code": "database_error",
+                    "message": "unexpected database error",
                     "context": {},
                 }
             },

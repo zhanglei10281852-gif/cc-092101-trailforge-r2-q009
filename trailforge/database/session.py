@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -18,6 +18,39 @@ from trailforge.database.base import Base
 from trailforge.errors import DatabaseBusyError
 
 T = TypeVar("T")
+
+
+def is_sqlite_busy(exc: BaseException) -> bool:
+    """Return True for SQLite lock-contention errors (and only those)."""
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+def begin_immediate(session: Session) -> None:
+    """Upgrade the session's transaction to ``BEGIN IMMEDIATE``.
+
+    SQLite opens deferred transactions: reads run outside any lock and the
+    write lock is only taken when the first DML statement executes. That
+    leaves a check-then-write window in which a concurrent connection can
+    commit between this transaction's reads and writes. ``BEGIN IMMEDIATE``
+    acquires the database write lock up front, serializing writers across
+    connections and processes without any in-process locking.
+
+    Lock contention surfaces as :class:`DatabaseBusyError` so it is never
+    confused with a business conflict. If the session already participates
+    in a transaction the existing transaction is left untouched.
+    """
+    if session.in_transaction():
+        return
+    try:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    except OperationalError as exc:
+        if is_sqlite_busy(exc):
+            raise DatabaseBusyError(
+                "timed out acquiring the SQLite write lock",
+                context={"reason": "begin_immediate"},
+            ) from exc
+        raise
 
 
 class Database:
@@ -81,32 +114,51 @@ class Database:
         finally:
             session.close()
 
+    @contextmanager
+    def write_session(self) -> Generator[Session, None, None]:
+        """Session whose transaction holds the SQLite write lock from the start.
+
+        Use this for read-modify-write operations that must stay consistent
+        under concurrent connections. Lock contention is reported as
+        :class:`DatabaseBusyError`; business errors pass through unchanged.
+        """
+        session = self.session_factory()
+        try:
+            begin_immediate(session)
+            yield session
+            session.commit()
+        except OperationalError as exc:
+            session.rollback()
+            if is_sqlite_busy(exc):
+                raise DatabaseBusyError(
+                    "SQLite database stayed busy beyond the configured timeout",
+                    context={"timeout_seconds": self.settings.sqlite_timeout_seconds},
+                ) from exc
+            raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def dependency(self) -> Generator[Session, None, None]:
         with self.session() as session:
             yield session
 
-    def run_write(self, operation: callable[[Session], T]) -> T:
+    def run_write(self, operation: Callable[[Session], T]) -> T:
         attempts = self.settings.sqlite_busy_retries + 1
         for attempt in range(attempts):
             try:
-                with self.session() as session:
+                with self.write_session() as session:
                     return operation(session)
-            except OperationalError as exc:
-                if not self._is_busy(exc) or attempt == attempts - 1:
-                    if self._is_busy(exc):
-                        raise DatabaseBusyError(
-                            "SQLite remained busy after configured retries",
-                            context={"attempts": attempts},
-                        ) from exc
-                    raise
-                delay = self.settings.sqlite_busy_backoff_seconds * (2**attempt)
-                time.sleep(delay)
+            except DatabaseBusyError as exc:
+                if attempt == attempts - 1:
+                    raise DatabaseBusyError(
+                        "SQLite remained busy after configured retries",
+                        context={"attempts": attempts},
+                    ) from exc
+                time.sleep(self.settings.sqlite_busy_backoff_seconds * (2**attempt))
         raise AssertionError("unreachable")
-
-    @staticmethod
-    def _is_busy(exc: OperationalError) -> bool:
-        message = str(exc).lower()
-        return "database is locked" in message or "database is busy" in message
 
     def verify_connection(self) -> dict[str, str | int]:
         with self.engine.connect() as connection:

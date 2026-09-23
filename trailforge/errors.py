@@ -47,6 +47,14 @@ class IdempotencyConflictError(ConflictError):
     code = "idempotency_conflict"
 
 
+class DuplicateRegistrationError(ConflictError):
+    code = "duplicate_registration"
+
+
+class ScheduleConflictError(ConflictError):
+    code = "schedule_conflict"
+
+
 class DatabaseBusyError(TrailForgeError):
     status_code = 503
     code = "database_busy"

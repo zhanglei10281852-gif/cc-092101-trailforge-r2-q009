@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import Engine, event
+from sqlalchemy import Engine, event, text
 from sqlalchemy import create_engine as sqlalchemy_create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -18,6 +18,38 @@ from trailforge.database.base import Base
 from trailforge.errors import DatabaseBusyError
 
 T = TypeVar("T")
+
+# SQLITE_BUSY ("database is locked") and SQLITE_LOCKED ("database table is
+# locked") both mean contention and are safe to retry; every other
+# OperationalError (e.g. a malformed statement or a missing object) is not.
+_BUSY_MARKERS = (
+    "database is locked",
+    "database is busy",
+    "database table is locked",
+)
+
+
+def begin_immediate(session: Session) -> None:
+    """Open the transaction with ``BEGIN IMMEDIATE``.
+
+    SQLite's default deferred transactions take no write lock until the first
+    write, which leaves a check-then-write window open between concurrent
+    connections. Acquiring the RESERVED lock up front serializes write
+    transactions while still allowing WAL readers to proceed. It is a no-op
+    when the session is already inside a transaction.
+    """
+    if not session.in_transaction():
+        session.execute(text("BEGIN IMMEDIATE"))
+
+
+def is_busy_error(exc: BaseException) -> bool:
+    """Return True only for SQLite lock-contention errors."""
+    orig = getattr(exc, "orig", None)
+    candidate = orig if orig is not None else exc
+    if isinstance(candidate, sqlite3.OperationalError) or isinstance(exc, OperationalError):
+        message = str(candidate).lower()
+        return any(marker in message for marker in _BUSY_MARKERS)
+    return False
 
 
 class Database:
@@ -41,6 +73,7 @@ class Database:
             class_=Session,
             autoflush=False,
             expire_on_commit=False,
+            info={"settings": settings},
         )
 
     def _configure_sqlite(self, engine: Engine) -> None:
@@ -92,8 +125,8 @@ class Database:
                 with self.session() as session:
                     return operation(session)
             except OperationalError as exc:
-                if not self._is_busy(exc) or attempt == attempts - 1:
-                    if self._is_busy(exc):
+                if not is_busy_error(exc) or attempt == attempts - 1:
+                    if is_busy_error(exc):
                         raise DatabaseBusyError(
                             "SQLite remained busy after configured retries",
                             context={"attempts": attempts},
@@ -102,11 +135,6 @@ class Database:
                 delay = self.settings.sqlite_busy_backoff_seconds * (2**attempt)
                 time.sleep(delay)
         raise AssertionError("unreachable")
-
-    @staticmethod
-    def _is_busy(exc: OperationalError) -> bool:
-        message = str(exc).lower()
-        return "database is locked" in message or "database is busy" in message
 
     def verify_connection(self) -> dict[str, str | int]:
         with self.engine.connect() as connection:

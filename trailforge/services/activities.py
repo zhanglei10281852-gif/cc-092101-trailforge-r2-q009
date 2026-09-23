@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from trailforge.database.base import utc_now
@@ -13,6 +14,7 @@ from trailforge.domain.enums import (
 from trailforge.errors import (
     CapacityError,
     ConflictError,
+    DuplicateRegistrationError,
     InvalidStateError,
     NotFoundError,
     ValidationError,
@@ -168,142 +170,183 @@ class ExpeditionService(ServiceBase):
 
     def register(self, expedition_id: int, data: RegistrationCreate) -> RegistrationResponse:
         scope = f"expedition:{expedition_id}:register"
-        prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
-        if prior is not None:
-            registration = self.session.get(ExpeditionRegistration, prior.resource_id)
-            if registration is None:
-                raise ConflictError("idempotency record references a missing registration")
-            return RegistrationResponse.model_validate(registration)
-        expedition = self.expeditions.get_detail(expedition_id, for_update=True)
-        if expedition is None:
-            raise NotFoundError(f"Expedition {expedition_id} was not found")
-        user = self.users.require(data.user_id)
-        if ActivityStatus(expedition.status) != ActivityStatus.OPEN:
-            raise InvalidStateError("registration is only available for open expeditions")
-        if utc_now() > expedition.registration_deadline:
-            raise ConflictError("registration deadline has passed")
-        existing = self.expeditions.get_registration(expedition_id, data.user_id)
-        if existing is not None and existing.status != RegistrationStatus.WITHDRAWN:
-            raise ConflictError("user is already registered for this expedition")
-        conflict = self.expeditions.conflicting_registration(
-            data.user_id,
-            expedition.start_at,
-            expedition.end_at,
-            exclude_expedition_id=expedition.id,
-        )
-        if conflict is not None:
-            raise ConflictError(
-                "user has another expedition during this time",
-                context={"conflicting_expedition_id": conflict.expedition_id},
+
+        def operate() -> RegistrationResponse:
+            prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
+            if prior is not None:
+                registration = self.session.get(ExpeditionRegistration, prior.resource_id)
+                if registration is None:
+                    raise ConflictError(
+                        "idempotency record references a missing registration"
+                    )
+                return RegistrationResponse.model_validate(registration)
+            expedition = self.expeditions.get_detail(expedition_id, for_update=True)
+            if expedition is None:
+                raise NotFoundError(f"Expedition {expedition_id} was not found")
+            user = self.users.require(data.user_id)
+            if ActivityStatus(expedition.status) != ActivityStatus.OPEN:
+                raise InvalidStateError("registration is only available for open expeditions")
+            if utc_now() > expedition.registration_deadline:
+                raise ConflictError("registration deadline has passed")
+            existing = self.expeditions.get_registration(expedition_id, data.user_id)
+            if existing is not None and existing.status != RegistrationStatus.WITHDRAWN:
+                raise DuplicateRegistrationError(
+                    "user is already registered for this expedition",
+                    context={"expedition_id": expedition_id, "user_id": data.user_id},
+                )
+            conflict = self.expeditions.conflicting_registration(
+                data.user_id,
+                expedition.start_at,
+                expedition.end_at,
+                exclude_expedition_id=expedition.id,
             )
-        fitness_rank = self.users.fitness_rank(user.id)
-        if fitness_rank is None:
-            raise ValidationError("a sport profile is required before registration")
-        if fitness_rank < expedition.minimum_fitness_level:
-            raise ValidationError(
-                "user fitness level does not meet expedition requirement",
-                context={
-                    "required": expedition.minimum_fitness_level,
-                    "actual": fitness_rank,
-                },
+            if conflict is not None:
+                raise ConflictError(
+                    "user has another expedition during this time",
+                    context={"conflicting_expedition_id": conflict.expedition_id},
+                )
+            fitness_rank = self.users.fitness_rank(user.id)
+            if fitness_rank is None:
+                raise ValidationError("a sport profile is required before registration")
+            if fitness_rank < expedition.minimum_fitness_level:
+                raise ValidationError(
+                    "user fitness level does not meet expedition requirement",
+                    context={
+                        "required": expedition.minimum_fitness_level,
+                        "actual": fitness_rank,
+                    },
+                )
+            confirmed = self.expeditions.confirmed_count(expedition.id)
+            status = (
+                RegistrationStatus.CONFIRMED
+                if confirmed < expedition.capacity
+                else RegistrationStatus.WAITLISTED
             )
-        confirmed = self.expeditions.confirmed_count(expedition.id)
-        status = (
-            RegistrationStatus.CONFIRMED
-            if confirmed < expedition.capacity
-            else RegistrationStatus.WAITLISTED
-        )
-        if existing is None:
-            registration = ExpeditionRegistration(
-                expedition_id=expedition.id,
-                user_id=user.id,
-                role=data.role,
-                status=status,
-                registered_at=utc_now(),
-                notes=data.notes,
+            if existing is None:
+                registration = ExpeditionRegistration(
+                    expedition_id=expedition.id,
+                    user_id=user.id,
+                    role=data.role,
+                    status=status,
+                    registered_at=utc_now(),
+                    notes=data.notes,
+                )
+                try:
+                    with self.session.begin_nested():
+                        self.session.add(registration)
+                        self.session.flush()
+                except IntegrityError as exc:
+                    raise DuplicateRegistrationError(
+                        "user is already registered for this expedition",
+                        context={"expedition_id": expedition_id, "user_id": data.user_id},
+                    ) from exc
+            else:
+                registration = existing
+                registration.role = data.role
+                registration.status = status
+                registration.registered_at = utc_now()
+                registration.withdrawn_at = None
+                registration.notes = data.notes
+                apply_version(registration, None)
+                self.session.flush()
+            response = RegistrationResponse.model_validate(registration)
+            try:
+                with self.session.begin_nested():
+                    self.save_idempotent(
+                        scope=scope,
+                        key=data.idempotency_key,
+                        payload=data,
+                        resource_type="expedition_registration",
+                        resource_id=registration.id,
+                        response=response.model_dump(mode="json"),
+                    )
+            except IntegrityError as exc:
+                prior = self.find_idempotent(
+                    scope=scope, key=data.idempotency_key, payload=data
+                )
+                if prior is not None:
+                    registration = self.session.get(
+                        ExpeditionRegistration, prior.resource_id
+                    )
+                    if registration is not None:
+                        return RegistrationResponse.model_validate(registration)
+                raise ConflictError(
+                    "idempotency key was already used with a different request",
+                    context={"scope": scope, "key": data.idempotency_key},
+                ) from exc
+            self.audit(
+                actor_id=user.id,
+                entity_type="expedition_registration",
+                entity_id=registration.id,
+                action=AuditAction.REGISTERED,
+                after=self.snapshot(registration),
+                context={"expedition_id": expedition.id, "capacity_status": status.value},
+                correlation_id=data.idempotency_key,
             )
-            self.session.add(registration)
-        else:
-            registration = existing
-            registration.role = data.role
-            registration.status = status
-            registration.registered_at = utc_now()
-            registration.withdrawn_at = None
-            registration.notes = data.notes
-            apply_version(registration, None)
-        self.session.flush()
-        response = RegistrationResponse.model_validate(registration)
-        self.save_idempotent(
-            scope=scope,
-            key=data.idempotency_key,
-            payload=data,
-            resource_type="expedition_registration",
-            resource_id=registration.id,
-            response=response.model_dump(mode="json"),
-        )
-        self.audit(
-            actor_id=user.id,
-            entity_type="expedition_registration",
-            entity_id=registration.id,
-            action=AuditAction.REGISTERED,
-            after=self.snapshot(registration),
-            context={"expedition_id": expedition.id, "capacity_status": status.value},
-            correlation_id=data.idempotency_key,
-        )
-        return response
+            return response
+
+        return self.run_serialized(operate)
 
     def withdraw(self, expedition_id: int, data: WithdrawalRequest) -> RegistrationResponse:
         scope = f"expedition:{expedition_id}:withdraw"
-        prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
-        if prior is not None:
-            registration = self.session.get(ExpeditionRegistration, prior.resource_id)
+
+        def operate() -> RegistrationResponse:
+            prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
+            if prior is not None:
+                registration = self.session.get(ExpeditionRegistration, prior.resource_id)
+                if registration is None:
+                    raise ConflictError(
+                        "idempotency record references a missing registration"
+                    )
+                return RegistrationResponse.model_validate(registration)
+            expedition = self.expeditions.get_detail(expedition_id, for_update=True)
+            if expedition is None:
+                raise NotFoundError(f"Expedition {expedition_id} was not found")
+            if ActivityStatus(expedition.status) in {
+                ActivityStatus.DEPARTED,
+                ActivityStatus.IN_PROGRESS,
+                ActivityStatus.COMPLETED,
+            }:
+                raise InvalidStateError("registration cannot be withdrawn after departure")
+            registration = self.expeditions.get_registration(
+                expedition_id, data.user_id, for_update=True
+            )
             if registration is None:
-                raise ConflictError("idempotency record references a missing registration")
-            return RegistrationResponse.model_validate(registration)
-        expedition = self.expeditions.get_detail(expedition_id, for_update=True)
-        if expedition is None:
-            raise NotFoundError(f"Expedition {expedition_id} was not found")
-        if ActivityStatus(expedition.status) in {
-            ActivityStatus.DEPARTED,
-            ActivityStatus.IN_PROGRESS,
-            ActivityStatus.COMPLETED,
-        }:
-            raise InvalidStateError("registration cannot be withdrawn after departure")
-        registration = self.expeditions.get_registration(
-            expedition_id, data.user_id, for_update=True
-        )
-        if registration is None:
-            raise NotFoundError("registration was not found")
-        if registration.role == TeamRole.LEADER and data.user_id == expedition.organizer_id:
-            raise ConflictError("organizer cannot withdraw; cancel or transfer the expedition")
-        if registration.status == RegistrationStatus.WITHDRAWN:
-            raise ConflictError("registration is already withdrawn")
-        registration.status = RegistrationStatus.WITHDRAWN
-        registration.withdrawn_at = utc_now()
-        registration.notes = f"{registration.notes}\nWithdrawal: {data.reason}".strip()
-        apply_version(registration, None)
-        self.session.flush()
-        self._promote_waitlist(expedition.id)
-        response = RegistrationResponse.model_validate(registration)
-        self.save_idempotent(
-            scope=scope,
-            key=data.idempotency_key,
-            payload=data,
-            resource_type="expedition_registration",
-            resource_id=registration.id,
-            response=response.model_dump(mode="json"),
-        )
-        self.audit(
-            actor_id=data.user_id,
-            entity_type="expedition_registration",
-            entity_id=registration.id,
-            action=AuditAction.WITHDRAWN,
-            before={"status": RegistrationStatus.CONFIRMED.value},
-            after={"status": RegistrationStatus.WITHDRAWN.value},
-            context={"reason": data.reason},
-            correlation_id=data.idempotency_key,
-        )
-        return response
+                raise NotFoundError("registration was not found")
+            if registration.role == TeamRole.LEADER and data.user_id == expedition.organizer_id:
+                raise ConflictError(
+                    "organizer cannot withdraw; cancel or transfer the expedition"
+                )
+            if registration.status == RegistrationStatus.WITHDRAWN:
+                raise ConflictError("registration is already withdrawn")
+            registration.status = RegistrationStatus.WITHDRAWN
+            registration.withdrawn_at = utc_now()
+            registration.notes = f"{registration.notes}\nWithdrawal: {data.reason}".strip()
+            apply_version(registration, None)
+            self.session.flush()
+            self._promote_waitlist(expedition.id)
+            response = RegistrationResponse.model_validate(registration)
+            self.save_idempotent(
+                scope=scope,
+                key=data.idempotency_key,
+                payload=data,
+                resource_type="expedition_registration",
+                resource_id=registration.id,
+                response=response.model_dump(mode="json"),
+            )
+            self.audit(
+                actor_id=data.user_id,
+                entity_type="expedition_registration",
+                entity_id=registration.id,
+                action=AuditAction.WITHDRAWN,
+                before={"status": RegistrationStatus.CONFIRMED.value},
+                after={"status": RegistrationStatus.WITHDRAWN.value},
+                context={"reason": data.reason},
+                correlation_id=data.idempotency_key,
+            )
+            return response
+
+        return self.run_serialized(operate)
 
     def roster(self, expedition_id: int) -> ExpeditionRoster:
         expedition = self.expeditions.get_detail(expedition_id)

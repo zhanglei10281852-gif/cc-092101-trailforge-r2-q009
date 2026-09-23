@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections.abc import Callable
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 from sqlalchemy import inspect
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from trailforge.config import Settings
+from trailforge.database.session import begin_immediate, is_busy_error
 from trailforge.domain.enums import AuditAction
-from trailforge.errors import IdempotencyConflictError
+from trailforge.errors import DatabaseBusyError, IdempotencyConflictError
 from trailforge.models.audit import AuditLog, IdempotencyRecord
 from trailforge.repositories.audit import IdempotencyRepository
+
+T = TypeVar("T")
 
 SENSITIVE_FIELDS = {
     "password",
@@ -27,6 +34,35 @@ SENSITIVE_FIELDS = {
 class ServiceBase:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def run_serialized(self, operation: Callable[[], T]) -> T:
+        """Run *operation* inside a ``BEGIN IMMEDIATE`` transaction.
+
+        All checks and writes of a mutating operation run while the connection
+        holds SQLite's writer lock, so concurrent connections observe each
+        other's committed state instead of interleaving check-then-write.
+        Only lock-contention errors trigger a bounded retry; every other error
+        propagates untouched and the surrounding session rolls the attempt
+        back, leaving no partial rows.
+        """
+        settings = self.session.info.get("settings") or Settings()
+        attempts = settings.sqlite_busy_retries + 1
+        last_error: OperationalError | None = None
+        for attempt in range(attempts):
+            try:
+                begin_immediate(self.session)
+                return operation()
+            except OperationalError as exc:
+                last_error = exc
+                if not is_busy_error(exc):
+                    raise
+                self.session.rollback()
+                if attempt < attempts - 1:
+                    time.sleep(settings.sqlite_busy_backoff_seconds * (2**attempt))
+        raise DatabaseBusyError(
+            "SQLite remained busy after configured retries",
+            context={"attempts": attempts},
+        ) from last_error
 
     def audit(
         self,
